@@ -1,0 +1,9 @@
+aiobale-py
+aiohttp
+aiofiles
+colorama
+pydantic
+typing_extensions
+blackboxprotobuf
+magic-filter
+flask
