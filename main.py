@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-🚀 ربات سلف‌بات بله + تبلیغ + پاکت
-👤 ورود با شماره + کد
-📢 تبلیغ هر ۱۵ ثانیه
+🚀 ربات سلف‌بات بله — نسخه سریع
+📱 ورود فوری با شماره و کد
+📢 تبلیغ خودکار
 🎁 پاکت خودکار
 """
 
@@ -18,7 +18,6 @@ import sys
 import sqlite3
 import random
 import traceback
-import signal
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from aiobale import Client, Dispatcher
@@ -28,9 +27,8 @@ from aiobale.enums import ChatType
 from aiobale.methods import OpenGiftPacket
 
 # ==================== تنظیمات ====================
-BOT_TOKEN = "1566501587:CKigTRWfyH0SlxhFpvl_ou_jKJc9NGKO-vE"
-ADMIN_ID = 0  # بعداً پر کن
-SUPPORT_ID = "@Idnuedobot"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "1566501587:CKigTRWfyH0SlxhFpvl_ou_jKJc9NGKO-vE")
+SUPPORT_ID = os.getenv("SUPPORT_ID", "@Idnuedobot")
 
 AD_TEXT = """🚀 کانالتو بترکون! با این ربات خفن
 ⚡ عضوگیر + سین‌زن حرفه‌ای بله
@@ -57,49 +55,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== متغیرهای سراسری ====================
-sessions = {}
-bot_session = None
+user_sessions = {}          # {chat_id: {state, phone, client, code_future}}
+active_client = None        # کلاینت فعال
+my_groups = []              # لیست گروه‌ها
+ad_task = None              # تسک تبلیغ
+bot_session = None          # aiohttp session
 gift_semaphore = asyncio.Semaphore(20)
-ad_task = None
-my_groups = []
+
 settings = {
     "gift_enabled": True,
     "ad_enabled": False,
     "ad_interval": AD_INTERVAL,
-    "gift_speed": GIFT_SPEED,
 }
 
 # ==================== توابع کمکی ====================
 def normalize_phone(phone_str):
+    """نرمال‌سازی شماره"""
     if not phone_str: return ""
     phone = phone_str.translate(PERSIAN_DIGITS)
     phone = re.sub(r'\D', '', phone)
     if phone.startswith('0'): phone = phone[1:]
     if phone.startswith('98') and len(phone) == 12: phone = phone[2:]
     if len(phone) == 10 and phone.startswith('9'): return phone
-    return phone
+    return ""
 
-async def send_bot_message(chat_id, text, reply_markup=None):
+async def send_msg(chat_id, text, markup=None):
+    """ارسال پیام"""
     try:
-        url = f"{BASE_URL}/sendMessage"
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-        if reply_markup: payload["reply_markup"] = reply_markup
-        async with bot_session.post(url, json=payload, timeout=10) as r:
+        if markup: payload["reply_markup"] = markup
+        async with bot_session.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10) as r:
             return await r.json()
     except Exception as e:
-        logger.error(f"Send error: {e}")
-        return None
-
-async def edit_bot_message(chat_id, message_id, text, reply_markup=None):
-    try:
-        url = f"{BASE_URL}/editMessageText"
-        payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
-        if reply_markup: payload["reply_markup"] = reply_markup
-        async with bot_session.post(url, json=payload, timeout=10) as r:
-            return await r.json()
-    except Exception as e:
-        logger.error(f"Edit error: {e}")
-        return None
+        logger.error(f"send_msg: {e}")
 
 # ==================== کیبوردها ====================
 def main_menu():
@@ -107,101 +95,80 @@ def main_menu():
         [{"text": "🚀 فعال‌سازی سلف", "callback_data": "activate_self"}],
         [{"text": "📊 وضعیت", "callback_data": "status"}],
         [{"text": "📖 راهنما", "callback_data": "help"}],
-        [{"text": "📞 پشتیبانی", "url": f"https://ble.ir/{SUPPORT_ID.replace('@','')}"}]
-    ]}
-
-def self_menu():
-    return {"inline_keyboard": [
-        [{"text": f"{'🟢' if settings['gift_enabled'] else '🔴'} پاکت خودکار", "callback_data": "toggle_gift"}],
-        [{"text": f"{'🟢' if settings['ad_enabled'] else '🔴'} تبلیغ خودکار", "callback_data": "toggle_ad"}],
-        [{"text": f"⏰ فاصله: {settings['ad_interval']}s", "callback_data": "set_interval"}],
-        [{"text": "👥 لیست گروه‌ها", "callback_data": "list_groups"}],
-        [{"text": "🔙 بازگشت", "callback_data": "back"}]
     ]}
 
 # ==================== پاکت خودکار ====================
-async def open_gift_fast(message, token):
+async def open_gift(message, token):
     async with gift_semaphore:
         try:
-            info_msg = InfoMessage(
+            info = InfoMessage(
                 peer=Peer(type=message.chat.type, id=message.chat.id),
                 message_id=message.message_id,
                 date=message.date,
                 previous_message=None
             )
             await asyncio.wait_for(
-                sessions["client"](OpenGiftPacket(
-                    message=info_msg,
-                    receiver_token=token,
-                    page_no={}
-                )),
+                active_client(OpenGiftPacket(message=info, receiver_token=token, page_no={})),
                 timeout=2.0
             )
             logger.info("🎁 پاکت باز شد!")
             try: await message.react("👍")
             except: pass
         except Exception as e:
-            logger.debug(f"پاکت: {e}")
+            logger.debug(f"gift: {e}")
 
 # ==================== تبلیغ ====================
 async def ad_loop():
-    global my_groups
     logger.info(f"📢 تبلیغ شروع (هر {settings['ad_interval']}s)")
-    
-    while settings['ad_enabled']:
+    while settings['ad_enabled'] and active_client:
         try:
             if not my_groups:
-                await asyncio.sleep(settings['ad_interval'])
-                continue
-            
-            client = sessions.get("client")
-            if not client: break
-            
+                await asyncio.sleep(5); continue
             logger.info(f"📢 ارسال به {len(my_groups)} گروه...")
             sem = asyncio.Semaphore(5)
-            
-            async def send_ad(g):
+            async def send_one(g):
                 async with sem:
                     try:
-                        await client.send_message(AD_TEXT, g['id'], ChatType.GROUP)
+                        await active_client.send_message(AD_TEXT, g['id'], ChatType.GROUP)
                         await asyncio.sleep(0.1)
                     except Exception as e:
-                        logger.debug(f"خطا {g.get('title','?')}: {e}")
-            
-            await asyncio.gather(*[send_ad(g) for g in my_groups], return_exceptions=True)
-            logger.info(f"✅ ارسال شد")
+                        logger.debug(f"{g.get('title','?')}: {e}")
+            await asyncio.gather(*[send_one(g) for g in my_groups], return_exceptions=True)
+            logger.info("✅ ارسال شد")
             await asyncio.sleep(settings['ad_interval'])
-        except asyncio.CancelledError:
-            break
+        except asyncio.CancelledError: break
         except Exception as e:
-            logger.error(f"خطا تبلیغ: {e}")
+            logger.error(f"ad_loop: {e}")
             await asyncio.sleep(5)
 
 # ==================== گرفتن گروه‌ها ====================
 async def refresh_groups():
     global my_groups
     try:
-        client = sessions.get("client")
-        if not client: return
-        dialogs = await client.get_dialogs()
+        if not active_client: return
+        dialogs = await active_client.get_dialogs()
         groups = []
         for d in dialogs:
             try:
                 chat = d.chat if hasattr(d, 'chat') else d
                 ct = getattr(chat, 'type', None)
                 if ct in (ChatType.GROUP, ChatType.SUPERGROUP):
-                    groups.append({'id': chat.id, 'title': getattr(chat, 'title', 'بدون نام')})
+                    groups.append({'id': chat.id, 'title': getattr(chat, 'title', '?')})
             except: continue
         my_groups = groups
         logger.info(f"👥 {len(my_groups)} گروه")
     except Exception as e:
-        logger.error(f"گروه‌ها: {e}")
+        logger.error(f"refresh_groups: {e}")
 
 # ==================== ساخت کلاینت ====================
-def create_client(session_file):
+def make_client(session_file, chat_id):
+    """ساخت کلاینت با هندلرها"""
+    global active_client
     dp = Dispatcher()
     client = Client(dp, session_file=session_file)
+    active_client = client
     
+    # هندلر پاکت
     @dp.message(IsGift())
     async def gift_handler(message: Message):
         if not settings['gift_enabled']: return
@@ -211,36 +178,30 @@ def create_client(session_file):
                 token = message.content.gift.token.value
         except: pass
         if token:
-            asyncio.create_task(open_gift_fast(message, token))
+            asyncio.create_task(open_gift(message, token))
     
+    # هندلر پیام‌های خودت
     @dp.message()
     async def msg_handler(message: Message):
         try:
             text = (message.text or "").strip()
-            chat_id = message.chat.id
             sender_id = getattr(message, 'sender_id', None)
-            
-            # فقط پیام‌های خودت
-            client = sessions.get("client")
-            if not client or not hasattr(client, 'me'): return
-            if sender_id != client.me.id: return
-            
+            if not client.me or sender_id != client.me.id: return
             if not text.startswith("."): return
             
             # راهنما
             if text in [".راهنما", ".help"]:
                 help_text = (
                     "📖 **راهنما**\n\n"
-                    "🔹 `.راهنما` → همین پیام\n"
-                    "🔹 `.وضعیت` → وضعیت\n"
-                    "🔹 `.گروه‌ها` → لیست گروه‌ها\n\n"
+                    "🔹 `.وضعیت` — وضعیت ربات\n"
+                    "🔹 `.گروه‌ها` — لیست گروه‌ها\n\n"
                     "📢 **تبلیغ:**\n"
-                    "🔹 `.تبلیغ` → شروع\n"
-                    "🔹 `.تبلیغ خاموش` → توقف\n"
-                    "🔹 `.فاصله 30` → تغییر فاصله\n\n"
+                    "🔹 `.تبلیغ` — شروع\n"
+                    "🔹 `.تبلیغ خاموش` — توقف\n"
+                    "🔹 `.فاصله 30` — تغییر فاصله\n\n"
                     "🎁 **پاکت:**\n"
                     "🔹 `.پاکت روشن` / `.پاکت خاموش`\n\n"
-                    "🛑 `.توقف` → خروج"
+                    "🛑 `.توقف` — خروج"
                 )
                 try: await message.reply(help_text)
                 except: pass
@@ -248,27 +209,27 @@ def create_client(session_file):
             
             # وضعیت
             if text == ".وضعیت":
-                status = (
+                s = (
                     f"📊 **وضعیت**\n\n"
-                    f"📢 تبلیغ: {'🟢 روشن' if settings['ad_enabled'] else '🔴 خاموش'}\n"
+                    f"📢 تبلیغ: {'🟢' if settings['ad_enabled'] else '🔴'}\n"
                     f"⏰ فاصله: {settings['ad_interval']}s\n"
-                    f"🎁 پاکت: {'🟢 روشن' if settings['gift_enabled'] else '🔴 خاموش'}\n"
+                    f"🎁 پاکت: {'🟢' if settings['gift_enabled'] else '🔴'}\n"
                     f"👥 گروه‌ها: {len(my_groups)}"
                 )
-                try: await message.reply(status)
+                try: await message.reply(s)
                 except: pass
                 return
             
-            # لیست گروه‌ها
+            # گروه‌ها
             if text == ".گروه‌ها":
                 if not my_groups:
                     try: await message.reply("❌ گروهی نیست!")
                     except: pass
                     return
-                txt = f"👥 **{len(my_groups)} گروه:**\n\n"
+                t = f"👥 **{len(my_groups)} گروه:**\n\n"
                 for i, g in enumerate(my_groups[:20], 1):
-                    txt += f"{i}. {g.get('title','?')}\n"
-                try: await message.reply(txt)
+                    t += f"{i}. {g.get('title','?')}\n"
+                try: await message.reply(t)
                 except: pass
                 return
             
@@ -282,7 +243,7 @@ def create_client(session_file):
                 global ad_task
                 if ad_task is None or ad_task.done():
                     ad_task = asyncio.create_task(ad_loop())
-                try: await message.reply(f"✅ تبلیغ روشن شد!\n👥 {len(my_groups)} گروه\n⏰ هر {settings['ad_interval']}s")
+                try: await message.reply(f"✅ تبلیغ روشن!\n👥 {len(my_groups)} گروه")
                 except: pass
                 return
             
@@ -311,13 +272,13 @@ def create_client(session_file):
             # پاکت
             if text == ".پاکت روشن":
                 settings['gift_enabled'] = True
-                try: await message.reply("✅ پاکت روشن شد")
+                try: await message.reply("✅ پاکت روشن")
                 except: pass
                 return
             
             if text == ".پاکت خاموش":
                 settings['gift_enabled'] = False
-                try: await message.reply("🛑 پاکت خاموش شد")
+                try: await message.reply("🛑 پاکت خاموش")
                 except: pass
                 return
             
@@ -327,159 +288,174 @@ def create_client(session_file):
                 except: pass
                 await asyncio.sleep(1)
                 os._exit(0)
-                
+        
         except Exception as e:
-            logger.error(f"Handler: {e}")
+            logger.error(f"msg_handler: {e}")
     
     return client
 
-# ==================== وب سرور (keep-alive) ====================
+# ==================== وب سرور ====================
 async def health(request):
     return web.Response(text="Bot is running!")
-
-async def ping(request):
-    return web.Response(text="pong")
 
 async def start_web():
     app = web.Application()
     app.router.add_get('/', health)
     app.router.add_get('/health', health)
-    app.router.add_get('/ping', ping)
+    app.router.add_get('/ping', health)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     logger.info(f"🌐 Web server on port {PORT}")
 
-# ==================== لاگین ====================
+# ==================== لاگین سریع ====================
 async def do_login(chat_id, phone):
+    """شروع لاگین"""
     try:
-        await send_bot_message(chat_id, "⏳ در حال ارسال کد...")
+        await send_msg(chat_id, "⏳ **در حال ارسال کد...**\n\nچند ثانیه صبر کن")
         
-        session_file = os.path.join(SESSIONS_DIR, "my_session.bale")
-        client = create_client(session_file)
+        session_file = os.path.join(SESSIONS_DIR, f"session_{chat_id}.bale")
+        
+        # پاک کردن سشن قبلی اگه هست
+        if os.path.exists(session_file):
+            try: os.remove(session_file)
+            except: pass
+        
+        client = make_client(session_file, chat_id)
         
         # callback برای کد
         code_future = asyncio.get_event_loop().create_future()
         
-        async def code_callback(phone, code_type, tx_hash):
-            await send_bot_message(chat_id, "🔑 کد رو از SMS بخون و تو ربات بفرست")
-            # منتظر کد از کاربر
-            while True:
-                if "code" in sessions:
-                    c = sessions.pop("code")
-                    return c
-                await asyncio.sleep(1)
+        async def code_callback(phone_arg, code_type, tx_hash):
+            logger.info(f"📨 callback کد برای {phone_arg}")
+            return await code_future
         
         client.phone_code_callback = code_callback
         
+        # ذخیره در session
+        user_sessions[chat_id] = {
+            "state": "waiting_code",
+            "phone": phone,
+            "client": client,
+            "code_future": code_future,
+        }
+        
+        # ارسال درخواست کد
         phone_for_auth = '98' + phone
-        await client.start_phone_auth(phone_for_auth)
+        logger.info(f"📤 درخواست کد برای {phone_for_auth}")
         
-        sessions["client"] = client
-        sessions["step"] = "waiting_code"
-        sessions["phone"] = phone
+        await asyncio.wait_for(client.start_phone_auth(phone_for_auth), timeout=30.0)
         
-        await send_bot_message(chat_id, "🔑 **کد SMS رو بفرست:**")
+        logger.info("✅ درخواست کد ارسال شد")
+        await send_msg(chat_id, "🔑 **کد SMS رو بفرست:**\n\n(۵ رقم)")
+        
+    except asyncio.TimeoutError:
+        await send_msg(chat_id, "❌ زمان ارسال کد تموم شد!\nدوباره `/start` بزن")
+        user_sessions.pop(chat_id, None)
     except Exception as e:
-        logger.error(f"Login: {e}")
-        await send_bot_message(chat_id, f"❌ خطا: {e}")
-        sessions.pop("client", None)
+        logger.error(f"do_login: {e}\n{traceback.format_exc()}")
+        await send_msg(chat_id, f"❌ خطا:\n`{str(e)[:200]}`")
+        user_sessions.pop(chat_id, None)
 
-# ==================== handle update ====================
+# ==================== تایید کد ====================
+async def verify_code(chat_id, code):
+    """تایید کد و راه‌اندازی"""
+    try:
+        sess = user_sessions.get(chat_id)
+        if not sess:
+            await send_msg(chat_id, "❌ سشن منقضی شد!\n`/start` بزن")
+            return
+        
+        client = sess["client"]
+        code_future = sess["code_future"]
+        
+        # پاک کردن فاصله‌های کد
+        code = code.strip().replace(" ", "").replace("-", "")
+        if not code.isdigit() or len(code) < 4:
+            await send_msg(chat_id, "❌ کد نامعتبر! ۵ رقم بفرست")
+            return
+        
+        # ارسال کد به callback
+        if not code_future.done():
+            code_future.set_result(code)
+        
+        await send_msg(chat_id, "✅ **کد دریافت شد!**\n\n⏳ در حال بررسی...")
+        
+        # صبر کن تا کلاینت validate کنه
+        # (validate_code خودش داخل start_phone_auth فراخوانی می‌شه)
+        
+        # شروع کلاینت در پس‌زمینه
+        async def start_client():
+            try:
+                await client.start(run_in_background=False, signal_handling=False)
+                # اگه رسیدیم اینجا، یعنی موفق
+                logger.info(f"✅ سشن {chat_id} فعال شد")
+                await send_msg(chat_id, "🎉 **ورود موفق!**\n\nحالا می‌تونی از دستورات استفاده کنی")
+                await refresh_groups()
+                await send_msg(chat_id, f"👥 {len(my_groups)} گروه پیدا شد\n\nاز منو استفاده کن:", main_menu())
+            except Exception as e:
+                logger.error(f"start_client: {e}\n{traceback.format_exc()}")
+                await send_msg(chat_id, f"❌ خطا در اتصال:\n`{str(e)[:200]}`")
+                user_sessions.pop(chat_id, None)
+        
+        asyncio.create_task(start_client())
+        user_sessions[chat_id]["state"] = "starting"
+        
+    except Exception as e:
+        logger.error(f"verify_code: {e}\n{traceback.format_exc()}")
+        await send_msg(chat_id, f"❌ خطا:\n`{str(e)[:200]}`")
+
+# ==================== Handle Update ====================
 async def handle_update(update):
     try:
-        # callback
         if "callback_query" in update:
             cb = update["callback_query"]
             chat_id = cb["message"]["chat"]["id"]
-            msg_id = cb["message"]["message_id"]
             data = cb["data"]
             
             if data == "activate_self":
-                sessions["admin_states"] = {"state": "waiting_phone", "chat_id": chat_id}
-                await edit_bot_message(chat_id, msg_id, "📱 **شماره موبایلت رو بفرست:**\n\nمثال: `09123456789`")
+                user_sessions[chat_id] = {"state": "waiting_phone"}
+                await send_msg(chat_id, "📱 **شماره موبایلت رو بفرست:**\n\nمثال: `09123456789`")
             
             elif data == "status":
-                status = (
-                    f"📊 **وضعیت**\n\n"
-                    f"📢 تبلیغ: {'🟢' if settings['ad_enabled'] else '🔴'}\n"
-                    f"⏰ فاصله: {settings['ad_interval']}s\n"
-                    f"🎁 پاکت: {'🟢' if settings['gift_enabled'] else '🔴'}\n"
-                    f"👥 گروه‌ها: {len(my_groups)}\n"
-                    f"🔌 اتصال: {'✅' if 'client' in sessions else '❌'}"
-                )
-                await edit_bot_message(chat_id, msg_id, status, self_menu())
+                s = (f"📊 **وضعیت**\n\n"
+                     f"📢 تبلیغ: {'🟢' if settings['ad_enabled'] else '🔴'}\n"
+                     f"🎁 پاکت: {'🟢' if settings['gift_enabled'] else '🔴'}\n"
+                     f"👥 گروه‌ها: {len(my_groups)}\n"
+                     f"🔌 اتصال: {'✅' if active_client else '❌'}")
+                await send_msg(chat_id, s, main_menu())
             
             elif data == "help":
-                help_text = (
-                    "📖 **راهنمای ربات**\n\n"
-                    "🔹 ورود با شماره و کد\n"
-                    "🔹 تبلیغ خودکار در گروه‌ها\n"
-                    "🔹 پاکت خودکار\n\n"
-                    "💡 تو گروه، دستور `.راهنما` رو بزن"
-                )
-                await edit_bot_message(chat_id, msg_id, help_text, {"inline_keyboard": [[{"text": "🔙 بازگشت", "callback_data": "back"}]]})
-            
-            elif data == "back":
-                await edit_bot_message(chat_id, msg_id, "🏠 منو:", main_menu())
-            
-            elif data == "toggle_gift":
-                settings['gift_enabled'] = not settings['gift_enabled']
-                await edit_bot_message(chat_id, msg_id, "⚙️ تنظیمات:", self_menu())
-            
-            elif data == "toggle_ad":
-                settings['ad_enabled'] = not settings['ad_enabled']
-                global ad_task
-                if settings['ad_enabled'] and (ad_task is None or ad_task.done()):
-                    ad_task = asyncio.create_task(ad_loop())
-                await edit_bot_message(chat_id, msg_id, "⚙️ تنظیمات:", self_menu())
-            
-            elif data == "set_interval":
-                await edit_bot_message(chat_id, msg_id, "⏰ فاصله رو تو گروه با `.فاصله 30` تنظیم کن")
-            
-            elif data == "list_groups":
-                if not my_groups:
-                    await edit_bot_message(chat_id, msg_id, "❌ گروهی نیست", self_menu())
-                else:
-                    txt = f"👥 **{len(my_groups)} گروه:**\n\n"
-                    for i, g in enumerate(my_groups[:20], 1):
-                        txt += f"{i}. {g.get('title','?')}\n"
-                    await edit_bot_message(chat_id, msg_id, txt, self_menu())
+                await send_msg(chat_id, "📖 توی گروه `.راهنما` بزن", main_menu())
         
-        # message
         if "message" in update:
             msg = update["message"]
             chat_id = msg["chat"]["id"]
             text = (msg.get("text") or "").strip()
-            user_id = msg.get("from", {}).get("id")
             
-            # /start
             if text == "/start":
-                await send_bot_message(chat_id, "🎫 **به ربات سلف‌بات خوش آمدی!**\n\nاز منو انتخاب کن:", main_menu())
+                await send_msg(chat_id, "🎫 **ربات سلف‌بات بله**\n\nاز منو انتخاب کن:", main_menu())
                 return
             
-            # اگه منتظر شماره
-            admin = sessions.get("admin_states", {})
-            if admin.get("state") == "waiting_phone":
+            sess = user_sessions.get(chat_id)
+            
+            # مرحله شماره
+            if sess and sess.get("state") == "waiting_phone":
                 phone = normalize_phone(text)
-                if len(phone) != 10:
-                    await send_bot_message(chat_id, "❌ شماره نامعتبر! مثال: `09123456789`")
+                if not phone:
+                    await send_msg(chat_id, "❌ شماره نامعتبر!\nمثال: `09123456789`")
                     return
-                admin["state"] = "waiting_code"
-                sessions["admin_states"] = admin
-                asyncio.create_task(do_login(chat_id, phone))
+                await do_login(chat_id, phone)
                 return
             
-            # اگه کد اومد
-            if sessions.get("step") == "waiting_code":
-                sessions["code"] = text
-                await send_bot_message(chat_id, "⏳ بررسی کد...")
-                # کد رو به callback بده
+            # مرحله کد
+            if sess and sess.get("state") == "waiting_code":
+                await verify_code(chat_id, text)
                 return
     
     except Exception as e:
-        logger.error(f"Update: {e}\n{traceback.format_exc()}")
+        logger.error(f"handle_update: {e}\n{traceback.format_exc()}")
 
 # ==================== Main ====================
 async def main():
@@ -487,14 +463,11 @@ async def main():
     
     logger.info("🚀 شروع ربات")
     
-    # Web
     await start_web()
     
-    # HTTP session
     connector = aiohttp.TCPConnector(limit=100)
     bot_session = aiohttp.ClientSession(connector=connector)
     
-    # Polling
     logger.info("📡 شروع polling")
     offset = 0
     while True:
@@ -508,20 +481,22 @@ async def main():
                     for upd in data["result"]:
                         offset = upd["update_id"]
                         asyncio.create_task(handle_update(upd))
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            logger.error(f"Polling: {e}")
+            logger.error(f"polling: {e}")
             await asyncio.sleep(3)
 
 if __name__ == "__main__":
     print("""
 ╔══════════════════════════════════════╗
 ║  🚀 ربات سلف‌بات بله                 ║
-║  📢 تبلیغ + 🎁 پاکت                  ║
+║  ⚡ نسخه سریع                        ║
 ╚══════════════════════════════════════╝
     """)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("🛑 خداحافظ!")
+        print("🛑")
     except Exception as e:
-        logger.critical(f"Fatal: {e}\n{traceback.format_exc()}")
+        logger.critical(f"Fatal: {e}")
