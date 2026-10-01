@@ -1,4 +1,4 @@
-aiobale
+aiobale-py
 aiohttp
 orjson
 uvloop
