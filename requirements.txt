@@ -1,9 +1,4 @@
-aiobale-py
+aiobale
 aiohttp
-aiofiles
-colorama
-pydantic
-typing_extensions
-blackboxprotobuf
-magic-filter
-flask
+orjson
+uvloop
