@@ -2,7 +2,9 @@ import requests
 import json
 import os
 import time
+import threading
 from datetime import datetime
+from flask import Flask, jsonify
 
 # ═══════════════════════════════════
 # ⚙️ تنظیمات
@@ -124,6 +126,28 @@ def cancel_keyboard():
 # ═══════════════════════════════════
 user_states = {}
 db = load_db()
+
+# ═══════════════════════════════════
+# 🌐 Flask
+# ═══════════════════════════════════
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "🤖 Hyper Ad Bot"
+
+@app.route("/ping")
+def ping():
+    return "pong ✅"
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "online",
+        "users": len(db["users"]),
+        "pending": len(db["pending"]),
+        "approved": len(db["approved"])
+    })
 
 # ═══════════════════════════════════
 # 🎯 پردازش پیام
@@ -420,7 +444,7 @@ def handle_callback(callback):
         print(f"❌ خطا callback: {e}")
 
 # ═══════════════════════════════════
-# 🚀 حلقه اصلی
+# 🚀 حلقه اصلی (Thread)
 # ═══════════════════════════════════
 def bot_loop():
     global db
@@ -468,7 +492,7 @@ def bot_loop():
             time.sleep(3)
 
 # ═══════════════════════════════════
-# 🚀 اجرا
+# 🚀 اجرا (Railway)
 # ═══════════════════════════════════
 if __name__ == "__main__":
     print("═" * 40)
@@ -477,4 +501,11 @@ if __name__ == "__main__":
     print(f"👥 تعداد لازم: {REQUIRED_COUNT} نفر")
     print("═" * 40)
 
-    bot_loop()
+    # اجرای bot_loop در thread جدا
+    bot_thread = threading.Thread(target=bot_loop, daemon=True)
+    bot_thread.start()
+
+    # اجرای Flask (keep-alive)
+    port = int(os.getenv("PORT", 5000))
+    print(f"🌐 Web server on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
