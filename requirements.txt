@@ -1,4 +1,3 @@
-aiobale-py
-aiohttp
-orjson
-uvloop
+requests
+flask
+gunicorn
